@@ -1,0 +1,236 @@
+name: Brain Agent
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: brainstorm-local-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+  pull-requests: write
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    if: >
+      (
+        github.event_name == 'issues' &&
+        (
+          github.event.sender.type == 'Bot' ||
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+        )
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.sender.type == 'User' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+        !contains(github.event.comment.body, '<!-- brain:posted -->')
+      )
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add eyes reaction
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+          if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then
+            COMMENT_ID=$(jq -r '.comment.id' "$GITHUB_EVENT_PATH")
+            REACTION_ID=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+              -f content=eyes --jq '.id')
+            printf '{"reaction_target":"comment","reaction_id":"%s","comment_id":"%s"}\n' \
+              "$REACTION_ID" "$COMMENT_ID" > /tmp/reaction-state.json
+          else
+            REACTION_ID=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/reactions" \
+              -f content=eyes --jq '.id')
+            printf '{"reaction_target":"issue","reaction_id":"%s"}\n' \
+              "$REACTION_ID" > /tmp/reaction-state.json
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pi CLI
+        run: npm install -g @mariozechner/pi-coding-agent
+
+      - name: Configure pi with Alibaba Cloud
+        env:
+          ALIKEY: ${{ secrets.ALIKEY }}
+        run: |
+          mkdir -p ~/.pi/agent
+          python3 .github/scripts/configure-pi.py
+
+      - name: Run agent
+        env:
+          ALIKEY: ${{ secrets.ALIKEY }}
+          ALIURL: ${{ secrets.ALIURL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSMOS_ENDPOINT: ${{ secrets.COSMOS_ENDPOINT }}
+          COSMOS_KEY: ${{ secrets.COSMOS_KEY }}
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_APIKEY: ${{ secrets.AZURE_APIKEY }}
+        run: |
+          set -euo pipefail
+          ISSUE_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+          TITLE=$(gh issue view "$ISSUE_NUMBER" --json title --jq '.title')
+
+          git config user.name "brain[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p state/issues state/sessions
+
+          MAPPING_FILE="state/issues/${ISSUE_NUMBER}.json"
+          SESSION_FLAG=""
+          if [ -f "$MAPPING_FILE" ]; then
+            SESS_PATH=$(jq -r '.sessionPath // empty' "$MAPPING_FILE")
+            if [ -n "$SESS_PATH" ] && [ -f "$SESS_PATH" ]; then
+              SESSION_FLAG="$SESS_PATH"
+              echo "Resuming session: $SESS_PATH"
+            fi
+          fi
+
+          FULL_FILE="state/issues/${ISSUE_NUMBER}.full.md"
+          SUMMARY_FILE="state/issues/${ISSUE_NUMBER}.sum.md"
+          bash .github/scripts/dump-issue.sh "$ISSUE_NUMBER" "$FULL_FILE"
+
+          if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then
+            NEW_INPUT=$(jq -r '.comment.body' "$GITHUB_EVENT_PATH")
+          else
+            BODY=$(gh issue view "$ISSUE_NUMBER" --json body --jq '.body')
+            NEW_INPUT=$(printf '%s\n\n%s' "$TITLE" "$BODY")
+          fi
+
+          if [ -f "$SUMMARY_FILE" ]; then
+            SUMMARY_CONTENT=$(cat "$SUMMARY_FILE")
+            printf '## Issue #%s: %s\n\n**Context summary**:\n\n%s\n\n---\n\n**New message:**\n\n%s\n\n---\n\nFull thread: state/issues/%s.full.md\n\n<reminder>\nDo NOT post a comment to issue #%s — the workflow will post your response automatically. Just return your answer as terminal output.\n</reminder>' \
+              "$ISSUE_NUMBER" "$TITLE" "$SUMMARY_CONTENT" "$NEW_INPUT" "$ISSUE_NUMBER" "$ISSUE_NUMBER" > /tmp/brain-prompt.txt
+          else
+            printf '## Issue #%s: %s\n\n**New message:**\n\n%s\n\n---\n\nFull thread: state/issues/%s.full.md\n\n<reminder>\nDo NOT post a comment to issue #%s — the workflow will post your response automatically. Just return your answer as terminal output.\n</reminder>' \
+              "$ISSUE_NUMBER" "$TITLE" "$NEW_INPUT" "$ISSUE_NUMBER" "$ISSUE_NUMBER" > /tmp/brain-prompt.txt
+          fi
+          PROMPT=$(cat /tmp/brain-prompt.txt)
+
+          echo "Running Brain via pi CLI..."
+          if [ -n "$SESSION_FLAG" ]; then
+            pi --mode json --session-dir ./state/sessions --session "$SESSION_FLAG" -p "$PROMPT" \
+              > /tmp/pi-raw.jsonl 2>/tmp/pi-stderr.txt || true
+          else
+            pi --mode json --session-dir ./state/sessions -p "$PROMPT" \
+              > /tmp/pi-raw.jsonl 2>/tmp/pi-stderr.txt || true
+          fi
+
+          if [ ! -s /tmp/pi-raw.jsonl ] && [ -s /tmp/pi-stderr.txt ]; then
+            echo "=== pi stderr ===" && cat /tmp/pi-stderr.txt
+          fi
+
+          AGENT_TEXT=$(python3 .github/scripts/extract-pi-response.py /tmp/pi-raw.jsonl)
+
+          LATEST_SESSION=$(ls -t state/sessions/*.jsonl 2>/dev/null | head -1 || echo "")
+          if [ -n "$LATEST_SESSION" ]; then
+            TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            python3 -c "import json; open('$MAPPING_FILE','w').write(json.dumps({'issueNumber':$ISSUE_NUMBER,'sessionPath':'$LATEST_SESSION','updatedAt':'$TS'},indent=2))"
+            echo "Saved mapping: issue #$ISSUE_NUMBER -> $LATEST_SESSION"
+          fi
+
+          git add -A
+          if ! git diff --cached --quiet; then
+            COMMIT_MSG=$(printf "brain: work on issue #%s\n\nCo-authored-by: Brain <github-actions[bot]@users.noreply.github.com>" "$ISSUE_NUMBER")
+            git commit -m "$COMMIT_MSG"
+          fi
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          for i in 1 2 3; do
+            if git push origin main; then break; fi
+            echo "Push failed, rebasing ($i/3)..."
+            git pull --rebase --autostash origin main || { git rebase --abort 2>/dev/null || true; break; }
+          done
+
+          SHOULD_POST=true
+          AGENT_USER=$(gh api /user --jq '.login' 2>/dev/null || echo "")
+          if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then
+            TRIGGER_TIME=$(jq -r '.comment.created_at' "$GITHUB_EVENT_PATH")
+          else
+            TRIGGER_TIME=$(jq -r '.issue.created_at' "$GITHUB_EVENT_PATH")
+          fi
+          JQ_FILTER=".user.login == \"github-actions[bot]\""
+          if [ -n "$AGENT_USER" ]; then
+            JQ_FILTER="$JQ_FILTER or .user.login == \"$AGENT_USER\""
+          fi
+          BOT_REPLIED=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=20" \
+            --jq "[.[] | select($JQ_FILTER) | select(.created_at > \"$TRIGGER_TIME\")] | length" \
+            2>/dev/null || echo "0")
+          if [ "${BOT_REPLIED:-0}" -gt 0 ] 2>/dev/null; then
+            echo "Cross-posting guard triggered — skipping."
+            SHOULD_POST=false
+          fi
+
+          if [ "$SHOULD_POST" = "true" ]; then
+            if [ -z "$AGENT_TEXT" ]; then
+              AGENT_TEXT="Brain: agent ran but returned no output. Check Actions logs."
+            fi
+            printf '%s\n\n<!-- brain:posted -->' "$AGENT_TEXT" | head -c 60000 > /tmp/brain-response.txt
+            gh issue comment "$ISSUE_NUMBER" --body-file /tmp/brain-response.txt
+          fi
+
+          # Summarize the interaction for future context
+          if [ -n "${ALIKEY:-}" ]; then
+            pip install openai -q 2>/dev/null || true
+            EXISTING_SUM=""
+            if [ -f "$SUMMARY_FILE" ]; then
+              EXISTING_SUM=$(cat "$SUMMARY_FILE")
+            fi
+            TODAY=$(date -u +%Y-%m-%d)
+            NEW_INPUT_LEN=$(echo -n "$NEW_INPUT" | wc -c)
+            AGENT_TEXT_LEN=$(echo -n "$AGENT_TEXT" | wc -c)
+            COMBINED_LEN=$((NEW_INPUT_LEN + AGENT_TEXT_LEN))
+            if [ "$COMBINED_LEN" -le 600 ]; then
+              NEW_ENTRY=$(printf '### %s\n**User:** %s\n\n**Brain:** %s' "$TODAY" "$NEW_INPUT" "$AGENT_TEXT")
+            else
+              SUM_SYSTEM="You are a technical learning archivist. Output only clean markdown, no preamble."
+              SUM_PROMPT=$(printf 'Issue #%s: %s\n\n## Existing summary\n\n%s\n\n## Latest user message\n\n%s\n\n## Brain response\n\n%s\n\n---\n\nWrite a brief entry (3-6 sentences) for THIS interaction. Start with ### %s. Output ONLY the new entry.' \
+                "$ISSUE_NUMBER" "$TITLE" "$EXISTING_SUM" "$NEW_INPUT" "$AGENT_TEXT" "$TODAY")
+              NEW_ENTRY=$(python3 .github/scripts/llm-ali.py \
+                --model qwen3.5-plus \
+                --system "$SUM_SYSTEM" \
+                --prompt "$SUM_PROMPT" 2>/dev/null) || true
+            fi
+            if [ -n "$NEW_ENTRY" ]; then
+              printf '\n\n%s' "$NEW_ENTRY" >> "$SUMMARY_FILE"
+              git add "$SUMMARY_FILE"
+              if ! git diff --cached --quiet; then
+                SUM_MSG=$(printf "chore: append interaction summary for issue #%s\n\nCo-authored-by: Brain <github-actions[bot]@users.noreply.github.com>" "$ISSUE_NUMBER")
+                git commit -m "$SUM_MSG"
+                for i in 1 2 3; do
+                  if git push origin main; then break; fi
+                  git pull --rebase --autostash origin main || break
+                done
+              fi
+            fi
+          fi
+
+      - name: Remove eyes reaction
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -f /tmp/reaction-state.json ] || exit 0
+          REACTION_TARGET=$(jq -r '.reaction_target' /tmp/reaction-state.json)
+          REACTION_ID=$(jq -r '.reaction_id' /tmp/reaction-state.json)
+          ISSUE_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+          if [ "$REACTION_TARGET" = "comment" ]; then
+            COMMENT_ID=$(jq -r '.comment_id' /tmp/reaction-state.json)
+            gh api "repos/$GITHUB_REPOSITORY/issues/comments/${COMMENT_ID}/reactions/${REACTION_ID}" \
+              -X DELETE || true
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/${ISSUE_NUMBER}/reactions/${REACTION_ID}" \
+              -X DELETE || true
+          fi

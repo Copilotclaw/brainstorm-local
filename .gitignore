@@ -1,0 +1,5 @@
+.pi/agent/
+state/sessions/
+__pycache__/
+*.pyc
+/tmp/

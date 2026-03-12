@@ -1,0 +1,4 @@
+{
+  "defaultProvider": "alibaba",
+  "defaultModel": "qwen3.5-plus"
+}
